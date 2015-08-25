@@ -44,7 +44,7 @@ import txamqp.spec
 
 try:
     import carbon
-except:
+except ImportError:
     # this is being run directly, carbon is not installed
     LIB_DIR = os.path.dirname(os.path.dirname(__file__))
     sys.path.insert(0, LIB_DIR)
@@ -120,6 +120,8 @@ class AMQPGraphiteProtocol(AMQClient):
                 else:
                     value, timestamp = line.split()
                 datapoint = ( float(timestamp), float(value) )
+                if datapoint[1] != datapoint[1]:  # filter out NaN values
+                    continue
             except ValueError:
                 log.listener("invalid message line: %s" % (line,))
                 continue
@@ -151,6 +153,7 @@ class AMQPReconnectingFactory(ReconnectingClientFactory):
         self.verbose = verbose
 
     def buildProtocol(self, addr):
+        self.resetDelay()
         p = self.protocol(self.delegate, self.vhost, self.spec)
         p.factory = self
         return p

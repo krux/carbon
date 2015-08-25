@@ -18,12 +18,14 @@ class Event:
     for handler in self.handlers:
       try:
         handler(*args, **kwargs)
-      except:
+      except Exception:
         log.err(None, "Exception in %s event handler: args=%s kwargs=%s" % (self.name, args, kwargs))
 
 
 metricReceived = Event('metricReceived')
 metricGenerated = Event('metricGenerated')
+specialMetricReceived = Event('specialMetricReceived')
+specialMetricGenerated = Event('specialMetricGenerated')
 cacheFull = Event('cacheFull')
 cacheSpaceAvailable = Event('cacheSpaceAvailable')
 pauseReceivingMetrics = Event('pauseReceivingMetrics')
@@ -31,6 +33,8 @@ resumeReceivingMetrics = Event('resumeReceivingMetrics')
 
 # Default handlers
 metricReceived.addHandler(lambda metric, datapoint: state.instrumentation.increment('metricsReceived'))
+specialMetricReceived.addHandler(lambda metric, datapoint: state.instrumentation.increment('metricsReceived'))
+
 
 cacheFull.addHandler(lambda: state.instrumentation.increment('cache.overflow'))
 cacheFull.addHandler(lambda: setattr(state, 'cacheTooFull', True))
