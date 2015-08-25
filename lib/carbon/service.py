@@ -20,11 +20,11 @@ from twisted.internet.protocol import ServerFactory
 from twisted.python.components import Componentized
 from twisted.python.log import ILogObserver
 # Attaching modules to the global state module simplifies import order hassles
-from carbon import util, state, events, instrumentation
+from carbon import state, util, events
 from carbon.log import carbonLogObserver
 from carbon.exceptions import CarbonConfigException
+
 state.events = events
-state.instrumentation = instrumentation
 
 
 class CarbonRootService(MultiService):
@@ -38,6 +38,11 @@ class CarbonRootService(MultiService):
 
 def createBaseService(config):
     from carbon.conf import settings
+    from carbon import instrumentation
+
+    global state
+    state.instrumentation = instrumentation
+
     from carbon.protocols import (MetricLineReceiver, MetricPickleReceiver,
                                   MetricDatagramReceiver)
 
@@ -57,16 +62,18 @@ def createBaseService(config):
         amqp_spec = settings.get("AMQP_SPEC", None)
         amqp_exchange_name = settings.get("AMQP_EXCHANGE", "graphite")
 
-    for interface, port, protocol in ((settings.LINE_RECEIVER_INTERFACE,
-                                       settings.LINE_RECEIVER_PORT,
-                                       MetricLineReceiver),
-                                      (settings.PICKLE_RECEIVER_INTERFACE,
-                                       settings.PICKLE_RECEIVER_PORT,
-                                       MetricPickleReceiver)):
+    for interface, port, backlog, protocol in ((settings.LINE_RECEIVER_INTERFACE,
+                                                settings.LINE_RECEIVER_PORT,
+                                                settings.LINE_RECEIVER_BACKLOG,
+                                                MetricLineReceiver),
+                                               (settings.PICKLE_RECEIVER_INTERFACE,
+                                                settings.PICKLE_RECEIVER_PORT,
+                                                settings.PICKLE_RECEIVER_BACKLOG,
+                                                MetricPickleReceiver)):
         if port:
             factory = ServerFactory()
             factory.protocol = protocol
-            service = TCPServer(int(port), factory, interface=interface)
+            service = TCPServer(int(port), factory, interface=interface, backlog=backlog)
             service.setServiceParent(root_service)
 
     if settings.ENABLE_UDP_LISTENER:
@@ -119,7 +126,8 @@ def createCacheService(config):
     factory = ServerFactory()
     factory.protocol = CacheManagementHandler
     service = TCPServer(int(settings.CACHE_QUERY_PORT), factory,
-                        interface=settings.CACHE_QUERY_INTERFACE)
+                        interface=settings.CACHE_QUERY_INTERFACE,
+                        backlog=settings.CACHE_QUERY_BACKLOG)
     service.setServiceParent(root_service)
 
     # have to import this *after* settings are defined
@@ -147,7 +155,7 @@ def createAggregatorService(config):
     root_service = createBaseService(config)
 
     # Configure application components
-    router = ConsistentHashingRouter()
+    router = ConsistentHashingRouter(settings.REPLICATION_FACTOR)
     client_manager = CarbonClientManager(router)
     client_manager.setServiceParent(root_service)
 

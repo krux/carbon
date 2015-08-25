@@ -7,8 +7,13 @@ from carbon.conf import settings
 from carbon.util import pickle
 from carbon import log, state, instrumentation
 
+try:
+    import signal
+except ImportError:
+    log.debug("Couldn't import signal module")
 
-SEND_QUEUE_LOW_WATERMARK = settings.MAX_QUEUE_SIZE * 0.8
+
+SEND_QUEUE_LOW_WATERMARK = settings.MAX_QUEUE_SIZE * settings.QUEUE_LOW_WATERMARK_PCT
 
 
 class CarbonClientProtocol(Int32StringReceiver):
@@ -102,6 +107,7 @@ class CarbonClientFactory(ReconnectingClientFactory):
     self.attemptedRelays = 'destinations.%s.attemptedRelays' % self.destinationName
     self.fullQueueDrops = 'destinations.%s.fullQueueDrops' % self.destinationName
     self.queuedUntilConnected = 'destinations.%s.queuedUntilConnected' % self.destinationName
+    self.relayMaxQueueLength = 'destinations.%s.relayMaxQueueLength' % self.destinationName
 
   def queueFullCallback(self, result):
     state.events.cacheFull()
@@ -153,6 +159,7 @@ class CarbonClientFactory(ReconnectingClientFactory):
 
   def sendDatapoint(self, metric, datapoint):
     instrumentation.increment(self.attemptedRelays)
+    instrumentation.max(self.relayMaxQueueLength, self.queueSize)
     queueSize = self.queueSize
     if queueSize >= settings.MAX_QUEUE_SIZE:
       if not self.queueFull.called:
@@ -205,6 +212,9 @@ class CarbonClientManager(Service):
     self.client_factories = {} # { destination : CarbonClientFactory() }
 
   def startService(self):
+    if 'signal' in globals().keys():
+      log.debug("Installing SIG_IGN for SIGHUP")
+      signal.signal(signal.SIGHUP, signal.SIG_IGN)
     Service.startService(self)
     for factory in self.client_factories.values():
       if not factory.started:
