@@ -3,7 +3,7 @@ import os
 import pwd
 import __builtin__
 
-from os.path import abspath, basename, dirname, join
+from os.path import abspath, basename, dirname
 try:
   from cStringIO import StringIO
 except ImportError:
@@ -65,11 +65,15 @@ def run_twistd_plugin(filename):
     if options.debug or options.nodaemon:
         twistd_options.extend(["--nodaemon"])
     if options.profile:
-        twistd_options.append("--profile")
+        twistd_options.extend(["--profile", options.profile])
+    if options.profiler:
+        twistd_options.extend(["--profiler", options.profiler])
     if options.pidfile:
         twistd_options.extend(["--pidfile", options.pidfile])
     if options.umask:
         twistd_options.extend(["--umask", options.umask])
+    if options.syslog:
+        twistd_options.append("--syslog")
 
     # Now for the plugin-specific options.
     twistd_options.append(program)
@@ -79,7 +83,7 @@ def run_twistd_plugin(filename):
 
     for option_name, option_value in vars(options).items():
         if (option_value is not None and
-            option_name not in ("debug", "profile", "pidfile", "umask", "nodaemon")):
+            option_name not in ("debug", "profile", "profiler", "pidfile", "umask", "nodaemon", "syslog")):
             twistd_options.extend(["--%s" % option_name.replace("_", "-"),
                                    option_value])
 
@@ -92,23 +96,76 @@ def run_twistd_plugin(filename):
     runApp(config)
 
 
-def parseDestinations(destination_strings):
-  destinations = []
-
-  for dest_string in destination_strings:
-    parts = dest_string.strip().split(':')
-    if len(parts) == 2:
-      server, port = parts
-      instance = None
-    elif len(parts) == 3:
-      server, port, instance = parts
+def parseDestination(dest_string):
+    s = dest_string.strip()
+    bidx = s.rfind(']:')    # find closing bracket and following colon.
+    cidx = s.find(':')
+    if s.startswith('[') and bidx is not None:
+        server = s[1:bidx]
+        port = s[bidx + 2:]
+    elif cidx is not None:
+        server = s[:cidx]
+        port = s[cidx + 1:]
     else:
-      raise ValueError("Invalid destination string \"%s\"" % dest_string)
+        raise ValueError("Invalid destination string \"%s\"" % dest_string)
 
-    destinations.append( (server, int(port), instance) )
+    if ':' in port:
+        port, _, instance = port.partition(':')
+    else:
+        instance = None
 
-  return destinations
+    return server, int(port), instance
 
+
+def parseDestinations(destination_strings):
+    return [parseDestination(dest_string) for dest_string in destination_strings]
+
+
+# Yes this is duplicated in whisper. Yes, duplication is bad.
+# But the code is needed in both places and we do not want to create
+# a dependency on whisper especiaily as carbon moves toward being a more
+# generic storage service that can use various backends.
+UnitMultipliers = {
+  's' : 1,
+  'm' : 60,
+  'h' : 60 * 60,
+  'd' : 60 * 60 * 24,
+  'w' : 60 * 60 * 24 * 7,
+  'y' : 60 * 60 * 24 * 365,
+}
+
+
+def getUnitString(s):
+  if s not in UnitMultipliers:
+    raise ValueError("Invalid unit '%s'" % s)
+  return s
+
+
+def parseRetentionDef(retentionDef):
+  import re
+  (precision, points) = retentionDef.strip().split(':')
+
+  if precision.isdigit():
+    precision = int(precision) * UnitMultipliers[getUnitString('s')]
+  else:
+    precision_re = re.compile(r'^(\d+)([a-z]+)$')
+    match = precision_re.match(precision)
+    if match:
+      precision = int(match.group(1)) * UnitMultipliers[getUnitString(match.group(2))]
+    else:
+      raise ValueError("Invalid precision specification '%s'" % precision)
+
+  if points.isdigit():
+    points = int(points)
+  else:
+    points_re = re.compile(r'^(\d+)([a-z]+)$')
+    match = points_re.match(points)
+    if match:
+      points = int(match.group(1)) * UnitMultipliers[getUnitString(match.group(2))] / precision
+    else:
+      raise ValueError("Invalid retention specification '%s'" % points)
+
+  return (precision, points)
 
 
 # This whole song & dance is due to pickle being insecure
@@ -119,8 +176,8 @@ def parseDestinations(destination_strings):
 if USING_CPICKLE:
   class SafeUnpickler(object):
     PICKLE_SAFE = {
-      'copy_reg' : set(['_reconstructor']),
-      '__builtin__' : set(['object']),
+      'copy_reg': set(['_reconstructor']),
+      '__builtin__': set(['object']),
     }
 
     @classmethod
@@ -142,9 +199,10 @@ if USING_CPICKLE:
 else:
   class SafeUnpickler(pickle.Unpickler):
     PICKLE_SAFE = {
-      'copy_reg' : set(['_reconstructor']),
-      '__builtin__' : set(['object']),
+      'copy_reg': set(['_reconstructor']),
+      '__builtin__': set(['object']),
     }
+
     def find_class(self, module, name):
       if not module in self.PICKLE_SAFE:
         raise pickle.UnpicklingError('Attempting to unpickle unsafe module %s' % module)
@@ -153,11 +211,11 @@ else:
       if not name in self.PICKLE_SAFE[module]:
         raise pickle.UnpicklingError('Attempting to unpickle unsafe class %s' % name)
       return getattr(mod, name)
- 
+
     @classmethod
     def loads(cls, pickle_string):
       return cls(StringIO(pickle_string)).load()
- 
+
 
 def get_unpickler(insecure=False):
   if insecure:
@@ -189,8 +247,10 @@ class TokenBucket(object):
       if blocking:
         tokens_needed = cost - self._tokens
         seconds_per_token = 1 / self.fill_rate
-        seconds_left = seconds_per_token * self.fill_rate
-        sleep(self.timestamp + seconds_left - time())
+        seconds_left = seconds_per_token * tokens_needed
+        time_to_sleep = self.timestamp + seconds_left - time()
+        if time_to_sleep > 0:
+            sleep(time_to_sleep)
         self._tokens -= cost
         return True
       return False
@@ -224,14 +284,3 @@ class PluginRegistrar(type):
     super(PluginRegistrar, classObj).__init__(name, bases, members)
     if hasattr(classObj, 'plugin_name'):
       classObj.plugins[classObj.plugin_name] = classObj
-
-
-def load_module(module_path, member=None):
-  module_name = splitext(basename(module_path))[0]
-  module_file = open(module_path, 'U')
-  description = ('.py', 'U', imp.PY_SOURCE)
-  module = imp.load_module(module_name, module_file, module_path, description)
-  if member:
-    return getattr(module, member)
-  else:
-    return module

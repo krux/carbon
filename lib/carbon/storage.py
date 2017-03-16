@@ -12,23 +12,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License."""
 
-import os, re
-import whisper
+import os
+import re
 
-from os.path import join, exists, sep
+from os.path import join, exists
 from carbon.conf import OrderedConfigParser, settings
 from carbon.exceptions import CarbonConfigException
-from carbon.util import pickle
-from carbon import log
+from carbon.util import pickle, parseRetentionDef
+from carbon import log, state
 
 
 STORAGE_SCHEMAS_CONFIG = join(settings.CONF_DIR, 'storage-schemas.conf')
 STORAGE_AGGREGATION_CONFIG = join(settings.CONF_DIR, 'storage-aggregation.conf')
 STORAGE_LISTS_DIR = join(settings.CONF_DIR, 'lists')
-
-def getFilesystemPath(metric):
-  metric_path = metric.replace('.',sep).lstrip(sep) + '.wsp'
-  return join(settings.LOCAL_DATA_DIR, metric_path)
 
 
 class Schema:
@@ -36,7 +32,7 @@ class Schema:
     raise NotImplementedError()
 
   def matches(self, metric):
-    return bool( self.test(metric) )
+    return bool(self.test(metric))
 
 
 class DefaultSchema(Schema):
@@ -61,52 +57,21 @@ class PatternSchema(Schema):
     return self.regex.search(metric)
 
 
-class ListSchema(Schema):
-
-  def __init__(self, name, listName, archives):
-    self.name = name
-    self.listName = listName
-    self.archives = archives
-    self.path = join(settings.WHITELISTS_DIR, listName)
-
-    if exists(self.path):
-      self.mtime = os.stat(self.path).st_mtime
-      fh = open(self.path, 'rb')
-      self.members = pickle.load(fh)
-      fh.close()
-
-    else:
-      self.mtime = 0
-      self.members = frozenset()
-
-  def test(self, metric):
-    if exists(self.path):
-      current_mtime = os.stat(self.path).st_mtime
-
-      if current_mtime > self.mtime:
-        self.mtime = current_mtime
-        fh = open(self.path, 'rb')
-        self.members = pickle.load(fh)
-        fh.close()
-
-    return metric in self.members
-
-
 class Archive:
 
-  def __init__(self,secondsPerPoint,points):
+  def __init__(self, secondsPerPoint, points):
     self.secondsPerPoint = int(secondsPerPoint)
     self.points = int(points)
 
   def __str__(self):
-    return "Archive = (Seconds per point: %d, Datapoints to save: %d)" % (self.secondsPerPoint, self.points) 
+    return "Archive = (Seconds per point: %d, Datapoints to save: %d)" % (self.secondsPerPoint, self.points)
 
   def getTuple(self):
-    return (self.secondsPerPoint,self.points)
+    return (self.secondsPerPoint, self.points)
 
   @staticmethod
   def fromString(retentionDef):
-    (secondsPerPoint, points) = whisper.parseRetentionDef(retentionDef)
+    (secondsPerPoint, points) = parseRetentionDef(retentionDef)
     return Archive(secondsPerPoint, points)
 
 
@@ -116,31 +81,31 @@ def loadStorageSchemas():
   config.read(STORAGE_SCHEMAS_CONFIG)
 
   for section in config.sections():
-    options = dict( config.items(section) )
-    matchAll = options.get('match-all')
+    options = dict(config.items(section))
     pattern = options.get('pattern')
-    listName = options.get('list')
 
-    retentions = options['retentions'].split(',')
-    archives = [ Archive.fromString(s) for s in retentions ]
-    
-    if matchAll:
-      mySchema = DefaultSchema(section, archives)
+    try:
+      retentions = options['retentions'].split(',')
+      archives = [Archive.fromString(s) for s in retentions]
+    except KeyError:
+      log.err("Schema %s missing 'retentions', skipping" % section)
+      continue
 
-    elif pattern:
+    if pattern:
       mySchema = PatternSchema(section, pattern, archives)
+    else:
+      log.err("Schema %s missing 'pattern', skipping" % section)
+      continue
 
-    elif listName:
-      mySchema = ListSchema(section, listName, archives)
-    
     archiveList = [a.getTuple() for a in archives]
 
     try:
-      whisper.validateArchiveList(archiveList)
+      if state.database is not None:
+        state.database.validateArchiveList(archiveList)
       schemaList.append(mySchema)
-    except whisper.InvalidConfiguration, e:
-      log.msg("Invalid schemas found in %s: %s" % (section, e) )
-  
+    except ValueError, e:
+      log.msg("Invalid schemas found in %s: %s" % (section, e))
+
   schemaList.append(defaultSchema)
   return schemaList
 
@@ -156,10 +121,8 @@ def loadAggregationSchemas():
     log.msg("%s not found or wrong perms, ignoring." % STORAGE_AGGREGATION_CONFIG)
 
   for section in config.sections():
-    options = dict( config.items(section) )
-    matchAll = options.get('match-all')
+    options = dict(config.items(section))
     pattern = options.get('pattern')
-    listName = options.get('list')
 
     xFilesFactor = options.get('xfilesfactor')
     aggregationMethod = options.get('aggregationmethod')
@@ -169,27 +132,25 @@ def loadAggregationSchemas():
         xFilesFactor = float(xFilesFactor)
         assert 0 <= xFilesFactor <= 1
       if aggregationMethod is not None:
-        assert aggregationMethod in whisper.aggregationMethods
+        if state.database is not None:
+          assert aggregationMethod in state.database.aggregationMethods
     except ValueError:
       log.msg("Invalid schemas found in %s." % section)
       continue
 
     archives = (xFilesFactor, aggregationMethod)
 
-    if matchAll:
-      mySchema = DefaultSchema(section, archives)
-
-    elif pattern:
+    if pattern:
       mySchema = PatternSchema(section, pattern, archives)
-
-    elif listName:
-      mySchema = ListSchema(section, listName, archives)
+    else:
+      log.err("Section missing 'pattern': %s" % section)
+      continue
 
     schemaList.append(mySchema)
 
   schemaList.append(defaultAggregation)
   return schemaList
 
-defaultArchive = Archive(60, 60 * 24 * 7) #default retention for unclassified data (7 days of minutely data)
+defaultArchive = Archive(60, 60 * 24 * 7)  # default retention for unclassified data (7 days of minutely data)
 defaultSchema = DefaultSchema('default', [defaultArchive])
 defaultAggregation = DefaultSchema('default', (None, None))
