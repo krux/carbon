@@ -34,8 +34,10 @@ else:
         cf.add_section('install')
     except ConfigParser.DuplicateSectionError:
         pass
-    cf.set('install', 'prefix', '/opt/graphite')
-    cf.set('install', 'install-lib', '%(prefix)s/lib')
+    if not cf.has_option('install', 'prefix'):
+        cf.set('install', 'prefix', '/opt/graphite')
+    if not cf.has_option('install', 'install-lib'):
+        cf.set('install', 'install-lib', '%(prefix)s/lib')
 
 with open('setup.cfg', 'wb') as f:
     cf.write(f)
@@ -49,24 +51,25 @@ else:
   setup_kwargs = dict()
 
 
-storage_dirs = [ ('storage/whisper',[]), ('storage/lists',[]),
-                 ('storage/log',[]), ('storage/rrd',[]) ]
+storage_dirs = [ ('storage/ceres', []), ('storage/whisper',[]),
+                 ('storage/lists',[]), ('storage/log',[]),
+                 ('storage/rrd',[]) ]
 conf_files = [ ('conf', glob('conf/*.example')) ]
 
 install_files = storage_dirs + conf_files
 
-# If we are building on RedHat, let's use the redhat init scripts.
-if platform.dist()[0] == 'redhat':
-    init_scripts = [ ('/etc/init.d', ['distro/redhat/init.d/carbon-cache',
+# Let's include redhat init scripts, despite build platform
+# but won't put them in /etc/init.d/ automatically anymore
+init_scripts = [ ('examples/init.d', ['distro/redhat/init.d/carbon-cache',
                                       'distro/redhat/init.d/carbon-relay',
                                       'distro/redhat/init.d/carbon-aggregator']) ]
-    install_files += init_scripts
+install_files += init_scripts
 
 try:
     setup(
       name='carbon',
-      version='0.9.10',
-      url='https://launchpad.net/graphite',
+      version='0.10.0-rc1',
+      url='http://graphiteapp.org/',
       author='Chris Davis',
       author_email='chrismd@gmail.com',
       license='Apache Software License 2.0',
@@ -77,7 +80,17 @@ try:
       scripts=glob('bin/*'),
       package_data={ 'carbon' : ['*.xml'] },
       data_files=install_files,
-      install_requires=['twisted', 'txamqp'],
+      install_requires=['Twisted', 'txAMQP'],
+      classifiers=(
+        'Intended Audience :: Developers',
+        'Natural Language :: English',
+        'License :: OSI Approved :: Apache Software License',
+        'Programming Language :: Python',
+        'Programming Language :: Python :: 2',
+        'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 2 :: Only',
+      ),
+
       **setup_kwargs
     )
 finally:

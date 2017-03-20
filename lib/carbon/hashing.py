@@ -14,7 +14,7 @@ class ConsistentHashRing:
       self.add_node(node)
 
   def compute_ring_position(self, key):
-    big_hash = md5( str(key) ).hexdigest()
+    big_hash = md5(str(key)).hexdigest()
     small_hash = int(big_hash[:4], 16)
     return small_hash
 
@@ -42,6 +42,11 @@ class ConsistentHashRing:
 
   def get_nodes(self, key):
     assert self.ring
+    if len(self.nodes) == 1:
+      # short circuit in simple 1-node case
+      for node in self.nodes:
+        yield node
+        return
     nodes = set()
     position = self.compute_ring_position(key)
     search_entry = (position, None)

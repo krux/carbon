@@ -12,15 +12,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License."""
 
-import os
 import time
-from os.path import exists, dirname
 
-import whisper
 from carbon import state
 from carbon.cache import MetricCache
-from carbon.storage import getFilesystemPath, loadStorageSchemas,\
-    loadAggregationSchemas
+from carbon.storage import loadStorageSchemas, loadAggregationSchemas
 from carbon.conf import settings
 from carbon import log, events, instrumentation
 from carbon.util import TokenBucket
@@ -37,7 +33,6 @@ except ImportError:
 
 SCHEMAS = loadStorageSchemas()
 AGGREGATION_SCHEMAS = loadAggregationSchemas()
-CACHE_SIZE_LOW_WATERMARK = settings.MAX_CACHE_SIZE * 0.95
 
 
 # Inititalize token buckets so that we can enforce rate limits on creates and
@@ -58,13 +53,10 @@ if settings.MAX_UPDATES_PER_SECOND != float('inf'):
 def optimalWriteOrder():
   """Generates metrics with the most cached values first and applies a soft
   rate limit on new metrics"""
-  while MetricCache:
-    (metric, datapoints) = MetricCache.drain_metric()
-    if state.cacheTooFull and MetricCache.size < CACHE_SIZE_LOW_WATERMARK:
-      events.cacheSpaceAvailable()
-
-    dbFilePath = getFilesystemPath(metric)
-    dbFileExists = exists(dbFilePath)
+  cache = MetricCache()
+  while cache:
+    (metric, datapoints) = cache.drain_metric()
+    dbFileExists = state.database.exists(metric)
 
     if not dbFileExists and CREATE_BUCKET:
       # If our tokenbucket has enough tokens available to create a new metric
@@ -75,19 +67,20 @@ def optimalWriteOrder():
       # when rate limitng unless our cache is too big or some other legit
       # reason.
       if CREATE_BUCKET.drain(1):
-        yield (metric, datapoints, dbFilePath, dbFileExists)
+        yield (metric, datapoints, dbFileExists)
       continue
 
-    yield (metric, datapoints, dbFilePath, dbFileExists)
+    yield (metric, datapoints, dbFileExists)
 
 
 def writeCachedDataPoints():
   "Write datapoints until the MetricCache is completely empty"
 
-  while MetricCache:
+  cache = MetricCache()
+  while cache:
     dataWritten = False
 
-    for (metric, datapoints, dbFilePath, dbFileExists) in optimalWriteOrder():
+    for (metric, datapoints, dbFileExists) in optimalWriteOrder():
       dataWritten = True
 
       if not dbFileExists:
@@ -96,49 +89,47 @@ def writeCachedDataPoints():
 
         for schema in SCHEMAS:
           if schema.matches(metric):
-            log.creates('new metric %s matched schema %s' % (metric, schema.name))
+            if settings.LOG_CREATES:
+              log.creates('new metric %s matched schema %s' % (metric, schema.name))
             archiveConfig = [archive.getTuple() for archive in schema.archives]
             break
 
         for schema in AGGREGATION_SCHEMAS:
           if schema.matches(metric):
-            log.creates('new metric %s matched aggregation schema %s' % (metric, schema.name))
+            if settings.LOG_CREATES:
+              log.creates('new metric %s matched aggregation schema %s'
+                          % (metric, schema.name))
             xFilesFactor, aggregationMethod = schema.archives
             break
 
         if not archiveConfig:
           raise Exception("No storage schema matched the metric '%s', check your storage-schemas.conf file." % metric)
 
-        dbDir = dirname(dbFilePath)
+        if settings.LOG_CREATES:
+          log.creates("creating database metric %s (archive=%s xff=%s agg=%s)" %
+                      (metric, archiveConfig, xFilesFactor, aggregationMethod))
         try:
-            if not exists(dbDir):
-                os.makedirs(dbDir)
-        except OSError, e:
-            log.err("%s" % e)
-        log.creates("creating database file %s (archive=%s xff=%s agg=%s)" %
-                    (dbFilePath, archiveConfig, xFilesFactor, aggregationMethod))
-        try:
-            whisper.create(
-                dbFilePath,
-                archiveConfig,
-                xFilesFactor,
-                aggregationMethod,
-                settings.WHISPER_SPARSE_CREATE,
-                settings.WHISPER_FALLOCATE_CREATE)
+            state.database.create(metric, archiveConfig, xFilesFactor, aggregationMethod)
             instrumentation.increment('creates')
-        except Exception:
-            log.err("Error creating %s" % (dbFilePath))
+        except Exception, e:
+            log.err()
+            log.msg("Error creating %s: %s" % (metric, e))
+            instrumentation.increment('errors')
             continue
       # If we've got a rate limit configured lets makes sure we enforce it
       if UPDATE_BUCKET:
         UPDATE_BUCKET.drain(1, blocking=True)
       try:
         t1 = time.time()
-        whisper.update_many(dbFilePath, datapoints)
+        # If we have duplicated points, always pick the last. update_many()
+        # has no guaranted behavior for that, and in fact the current implementation
+        # will keep the first point in the list.
+        datapoints = dict(datapoints).items()
+        state.database.write(metric, datapoints)
         updateTime = time.time() - t1
-      except Exception:
-        log.msg("Error writing to %s" % (dbFilePath))
+      except Exception, e:
         log.err()
+        log.msg("Error writing to %s: %s" % (metric, e))
         instrumentation.increment('errors')
       else:
         pointCount = len(datapoints)
@@ -158,25 +149,23 @@ def writeForever():
       writeCachedDataPoints()
     except Exception:
       log.err()
-    time.sleep(1)  # The writer thread only sleeps when the cache is empty or an error occurs
+    time.sleep(0.1)  # The writer thread only sleeps when the cache is empty or an error occurs
 
 
 def reloadStorageSchemas():
   global SCHEMAS
   try:
     SCHEMAS = loadStorageSchemas()
-  except Exception:
-    log.msg("Failed to reload storage SCHEMAS")
-    log.err()
+  except Exception, e:
+    log.msg("Failed to reload storage SCHEMAS: %s" % (e))
 
 
 def reloadAggregationSchemas():
   global AGGREGATION_SCHEMAS
   try:
     AGGREGATION_SCHEMAS = loadAggregationSchemas()
-  except Exception:
-    log.msg("Failed to reload aggregation SCHEMAS")
-    log.err()
+  except Exception, e:
+    log.msg("Failed to reload aggregation SCHEMAS: %s" % (e))
 
 
 def shutdownModifyUpdateSpeed():

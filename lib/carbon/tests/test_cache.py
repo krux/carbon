@@ -1,6 +1,6 @@
 from unittest import TestCase
 from mock import Mock, PropertyMock, patch
-from carbon.cache import _MetricCache, DrainStrategy, MaxStrategy, RandomStrategy, SortedStrategy
+from carbon.cache import MetricCache, _MetricCache, DrainStrategy, MaxStrategy, RandomStrategy, SortedStrategy, TimeSortedStrategy
 
 
 class MetricCacheTest(TestCase):
@@ -16,6 +16,16 @@ class MetricCacheTest(TestCase):
 
   def tearDown(self):
     self._settings_patch.stop()
+
+  def test_constructor(self):
+    settings = {
+      'CACHE_WRITE_STRATEGY': 'max',
+    }
+    settings_patch = patch.dict('carbon.conf.settings', settings)
+    settings_patch.start()
+    cache = MetricCache()
+    self.assertNotEqual(cache, None)
+    self.assertTrue(isinstance(cache.strategy, MaxStrategy))
 
   def test_cache_is_a_dict(self):
     self.assertTrue(issubclass(_MetricCache, dict))
@@ -48,14 +58,14 @@ class MetricCacheTest(TestCase):
       with patch('carbon.cache.events'):
         metric_cache = _MetricCache()
         metric_cache.store('foo', (123456, 1.0))
-        is_full_mock.assert_called_once()
+        self.assertEqual(1, is_full_mock.call_count)
 
   def test_store_on_full_triggers_events(self):
     is_full_mock = PropertyMock(return_value=True)
     with patch.object(_MetricCache, 'is_full', is_full_mock):
       with patch('carbon.cache.events') as events_mock:
         self.metric_cache.store('foo', (123456, 1.0))
-        events_mock.return_value.cacheFull.assert_called_once()
+        events_mock.cacheFull.assert_called_with()
 
   def test_pop_multiple_datapoints(self):
     self.metric_cache.store('foo', (123456, 1.0))
@@ -74,7 +84,14 @@ class MetricCacheTest(TestCase):
     with patch.object(self.metric_cache, '_check_available_space') as check_space_mock:
       self.metric_cache.store('foo', (123456, 1.0))
       self.metric_cache.pop('foo')
-      check_space_mock.assert_called_once()
+      self.assertEqual(1, check_space_mock.call_count)
+
+  def test_pop_triggers_space_event(self):
+    with patch('carbon.state.cacheTooFull', new=Mock(return_value=True)):
+      with patch('carbon.cache.events') as events_mock:
+        self.metric_cache.store('foo', (123456, 1.0))
+        self.metric_cache.pop('foo')
+        events_mock.cacheSpaceAvailable.assert_called_with()
 
   def test_pop_returns_sorted_timestamps(self):
     self.metric_cache.store('foo', (123457, 2.0))
@@ -216,6 +233,30 @@ class DrainStrategyTest(TestCase):
     self.assertEqual('foo', sorted_strategy.choose_item())
     self.assertEqual('bar', sorted_strategy.choose_item())
     self.assertEqual('baz', sorted_strategy.choose_item())
+
+  def test_time_sorted_strategy(self):
+    self.metric_cache.store('foo', (123456, 1.0))
+    self.metric_cache.store('foo', (123457, 2.0))
+    self.metric_cache.store('foo', (123458, 3.0))
+    self.metric_cache.store('bar', (123459, 4.0))
+    self.metric_cache.store('bar', (123460, 5.0))
+    self.metric_cache.store('baz', (123461, 6.0))
+
+    time_sorted_strategy = TimeSortedStrategy(self.metric_cache)
+    # In order: foo, bar, baz
+    self.assertEqual('foo', time_sorted_strategy.choose_item())
+
+    # 'baz' gets older points.
+    self.metric_cache.store('baz', (123450, 6.0))
+    self.metric_cache.store('baz', (123451, 6.0))
+    # But 'bar' is popped anyway, because sort has already happened
+    self.assertEqual('bar', time_sorted_strategy.choose_item())
+    self.assertEqual('baz', time_sorted_strategy.choose_item())
+
+    # Sort happens again
+    self.assertEqual('baz', time_sorted_strategy.choose_item())
+    self.assertEqual('foo', time_sorted_strategy.choose_item())
+    self.assertEqual('bar', time_sorted_strategy.choose_item())
 
 
 class RandomStrategyTest(TestCase):

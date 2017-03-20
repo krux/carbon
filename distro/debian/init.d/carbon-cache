@@ -3,16 +3,16 @@
 # description: carbon-cache
 # processname: carbon-cache
 
+export PYTHONPATH="$GRAPHITE_DIR/lib:$PYTHONPATH"
+
 # Source function library.
-if [ -e /etc/rc.d/init.d/functions ]; then
-    . /etc/rc.d/init.d/functions;
+if [ -e /lib/lsb/init-functions ]; then
+    . /lib/lsb/init-functions
 fi;
 
 CARBON_DAEMON="cache"
 GRAPHITE_DIR="/opt/graphite"
 INSTANCES=`grep "^\[${CARBON_DAEMON}" ${GRAPHITE_DIR}/conf/carbon.conf | cut -d \[ -f 2 | cut -d \] -f 1 | cut -d : -f 2`
-
-export PYTHONPATH="$GRAPHITE_DIR/lib:$PYTHONPATH"
 
 function die {
   echo $1
@@ -26,13 +26,13 @@ start(){
         if [ "${INSTANCE}" == "${CARBON_DAEMON}" ]; then
             INSTANCE="a";
         fi;
-        echo "Starting carbon-${CARBON_DAEMON}:${INSTANCE}..."
+        log_action_begin_msg "Starting carbon-${CARBON_DAEMON}:${INSTANCE}..."
         bin/carbon-${CARBON_DAEMON}.py --instance=${INSTANCE} start;
 
         if [ $? -eq 0 ]; then
-            echo_success
+            log_success_msg
         else
-            echo_failure
+            log_failure_msg
         fi;
         echo ""
     done;
@@ -45,7 +45,7 @@ stop(){
         if [ "${INSTANCE}" == "${CARBON_DAEMON}" ]; then
             INSTANCE="a";
         fi;
-        echo "Stopping carbon-${CARBON_DAEMON}:${INSTANCE}..."
+        log_action_begin_msg "Stopping carbon-${CARBON_DAEMON}:${INSTANCE}..."
         bin/carbon-${CARBON_DAEMON}.py --instance=${INSTANCE} stop
 
         if [ `sleep 3; /usr/bin/pgrep -f "carbon-${CARBON_DAEMON}.py --instance=${INSTANCE}" | /usr/bin/wc -l` -gt 0 ]; then
@@ -55,9 +55,9 @@ stop(){
         fi;
 
         if [ $? -eq 0 ]; then
-            echo_success
+            log_success_msg
         else
-            echo_failure
+            log_failure_msg
         fi;
         echo ""
     done;
@@ -73,9 +73,9 @@ status(){
         bin/carbon-${CARBON_DAEMON}.py --instance=${INSTANCE} status;
     
         if [ $? -eq 0 ]; then
-            echo_success
+            log_success_msg
         else
-            echo_failure
+            log_failure_msg
         fi;
         echo ""
     done;

@@ -21,8 +21,9 @@ from os.path import join, dirname, normpath, exists, isdir
 from optparse import OptionParser
 from ConfigParser import ConfigParser
 
-import whisper
-from carbon import log
+from carbon import log, state
+from carbon.database import TimeSeriesDatabase
+from carbon.routers import DatapointRouter
 from carbon.exceptions import CarbonConfigException
 
 from twisted.python import usage
@@ -33,6 +34,7 @@ defaults = dict(
   MAX_CACHE_SIZE=float('inf'),
   MAX_UPDATES_PER_SECOND=500,
   MAX_CREATES_PER_MINUTE=float('inf'),
+  MIN_TIMESTAMP_RESOLUTION=0,
   LINE_RECEIVER_INTERFACE='0.0.0.0',
   LINE_RECEIVER_PORT=2003,
   ENABLE_UDP_LISTENER=False,
@@ -40,21 +42,33 @@ defaults = dict(
   UDP_RECEIVER_PORT=2003,
   PICKLE_RECEIVER_INTERFACE='0.0.0.0',
   PICKLE_RECEIVER_PORT=2004,
+  MAX_RECEIVER_CONNECTIONS=float('inf'),
   CACHE_QUERY_INTERFACE='0.0.0.0',
   CACHE_QUERY_PORT=7002,
   LOG_UPDATES=True,
+  LOG_CREATES=True,
   LOG_CACHE_HITS=True,
+  LOG_CACHE_QUEUE_SORTS=True,
+  DATABASE='whisper',
   WHISPER_AUTOFLUSH=False,
   WHISPER_SPARSE_CREATE=False,
   WHISPER_FALLOCATE_CREATE=False,
   WHISPER_LOCK_WRITES=False,
+  WHISPER_FADVISE_RANDOM=False,
+  CERES_MAX_SLICE_GAP=80,
+  CERES_NODE_CACHING_BEHAVIOR='all',
+  CERES_SLICE_CACHING_BEHAVIOR='latest',
+  CERES_LOCK_WRITES=False,
   MAX_DATAPOINTS_PER_MESSAGE=500,
   MAX_AGGREGATION_INTERVALS=5,
+  FORWARD_ALL=True,
   MAX_QUEUE_SIZE=1000,
   QUEUE_LOW_WATERMARK_PCT=0.8,
   TIME_TO_DEFER_SENDING=0.0001,
   ENABLE_AMQP=False,
+  AMQP_METRIC_NAME_IN_BODY=False,
   AMQP_VERBOSE=False,
+  AMQP_SPEC=None,
   BIND_PATTERNS=['#'],
   ENABLE_MANHOLE=False,
   MANHOLE_INTERFACE='127.0.0.1',
@@ -63,7 +77,9 @@ defaults = dict(
   MANHOLE_PUBLIC_KEY="",
   RELAY_METHOD='rules',
   REPLICATION_FACTOR=1,
+  DIVERSE_REPLICAS=True,
   DESTINATIONS=[],
+  DESTINATION_PROTOCOL="pickle",
   USE_FLOW_CONTROL=True,
   USE_INSECURE_UNPICKLER=False,
   USE_WHITELIST=False,
@@ -80,12 +96,10 @@ defaults = dict(
   AGGREGATION_RULES='aggregation-rules.conf',
   REWRITE_RULES='rewrite-rules.conf',
   RELAY_RULES='relay-rules.conf',
-  ENABLE_LOGROTATE=True,
+  ENABLE_LOGROTATION=True,
+  METRIC_CLIENT_IDLE_TIMEOUT=None,
 )
 
-
-def _umask(value):
-    return int(value, 8)
 
 def _process_alive(pid):
     if exists("/proc"):
@@ -112,18 +126,19 @@ class OrderedConfigParser(ConfigParser):
 
     result = ConfigParser.read(self, path)
     sections = []
-    for line in open(path):
-      line = line.strip()
+    with open(path) as f:
+      for line in f:
+        line = line.strip()
 
-      if line.startswith('[') and line.endswith(']'):
-        sections.append( line[1:-1] )
+        if line.startswith('[') and line.endswith(']'):
+          sections.append(line[1:-1])
 
     self._ordered_sections = sections
 
     return result
 
   def sections(self):
-    return list( self._ordered_sections ) # return a copy for safety
+    return list(self._ordered_sections)  # return a copy for safety
 
 
 class Settings(dict):
@@ -141,17 +156,17 @@ class Settings(dict):
     if not parser.has_section(section):
       return
 
-    for key,value in parser.items(section):
+    for key, value in parser.items(section):
       key = key.upper()
 
       # Detect type from defaults dict
       if key in defaults:
-        valueType = type( defaults[key] )
+        valueType = type(defaults[key])
       else:
         valueType = str
 
       if valueType is list:
-        value = [ v.strip() for v in value.split(',') ]
+        value = [v.strip() for v in value.split(',')]
 
       elif valueType is bool:
         value = parser.getboolean(section, key)
@@ -177,7 +192,7 @@ class CarbonCacheOptions(usage.Options):
 
     optFlags = [
         ["debug", "", "Run in debug mode."],
-        ]
+    ]
 
     optParameters = [
         ["config", "c", None, "Use the given config file."],
@@ -185,7 +200,7 @@ class CarbonCacheOptions(usage.Options):
         ["logdir", "", None, "Write logs to the given directory."],
         ["whitelist", "", None, "List of metric patterns to allow."],
         ["blacklist", "", None, "List of metric patterns to disallow."],
-        ]
+    ]
 
     def postOptions(self):
         global settings
@@ -232,22 +247,22 @@ class CarbonCacheOptions(usage.Options):
             print "Error: missing required config %s" % storage_schemas
             sys.exit(1)
 
-        if settings.WHISPER_AUTOFLUSH:
-            log.msg("Enabling Whisper autoflush")
-            whisper.AUTOFLUSH = True
+        if settings.CACHE_WRITE_STRATEGY not in ('timesorted', 'sorted', 'max', 'naive'):
+            log.err("%s is not a valid value for CACHE_WRITE_STRATEGY, defaulting to %s" %
+                    (settings.CACHE_WRITE_STRATEGY, defaults['CACHE_WRITE_STRATEGY']))
+        else:
+            log.msg("Using %s write strategy for cache" % settings.CACHE_WRITE_STRATEGY)
 
-        if settings.WHISPER_FALLOCATE_CREATE:
-            if whisper.CAN_FALLOCATE:
-                log.msg("Enabling Whisper fallocate support")
-            else:
-                log.err("WHISPER_FALLOCATE_CREATE is enabled but linking failed.")
+        # Database-specific settings
+        database = settings.DATABASE
+        if database not in TimeSeriesDatabase.plugins:
+            print "No database plugin implemented for '%s'" % database
+            raise SystemExit(1)
 
-        if settings.WHISPER_LOCK_WRITES:
-            if whisper.CAN_LOCK:
-                log.msg("Enabling Whisper file locking")
-                whisper.LOCK = True
-            else:
-                log.err("WHISPER_LOCK_WRITES is enabled but import of fcntl module failed.")
+        database_class = TimeSeriesDatabase.plugins[database]
+        state.database = database_class(settings)
+
+        settings.CACHE_SIZE_LOW_WATERMARK = settings.MAX_CACHE_SIZE * 0.95
 
         if not "action" in self:
             self["action"] = "start"
@@ -258,7 +273,8 @@ class CarbonCacheOptions(usage.Options):
         # are set to log to syslog, then use that instead.
         if not self["debug"]:
             if self.parent.get("syslog", None):
-                log.logToSyslog(self.parent["prefix"])
+                prefix = "%s-%s[%d]" % (program, self["instance"], os.getpid())
+                log.logToSyslog(prefix)
             elif not self.parent["nodaemon"]:
                 logdir = settings.LOG_DIR
                 if not isdir(logdir):
@@ -305,6 +321,9 @@ class CarbonCacheOptions(usage.Options):
             try:
                 pid = int(pf.read().strip())
                 pf.close()
+            except ValueError:
+                print "Failed to parse pid from pidfile %s" % pidfile
+                raise SystemExit(1)
             except IOError:
                 print "Could not read pidfile %s" % pidfile
                 raise SystemExit(1)
@@ -327,6 +346,9 @@ class CarbonCacheOptions(usage.Options):
             try:
                 pid = int(pf.read().strip())
                 pf.close()
+            except ValueError:
+                print "Failed to parse pid from pidfile %s" % pidfile
+                raise SystemExit(1)
             except IOError:
                 print "Failed to read pid from %s" % pidfile
                 raise SystemExit(1)
@@ -345,6 +367,9 @@ class CarbonCacheOptions(usage.Options):
                 try:
                     pid = int(pf.read().strip())
                     pf.close()
+                except ValueError:
+                    print "Failed to parse pid from pidfile %s" % pidfile
+                    SystemExit(1)
                 except IOError:
                     print "Could not read pidfile %s" % pidfile
                     raise SystemExit(1)
@@ -412,14 +437,14 @@ class CarbonRelayOptions(CarbonCacheOptions):
         settings["relay-rules"] = self["rules"]
 
         if self["aggregation-rules"] is None:
-            self["rules"] = join(settings["CONF_DIR"], settings['AGGREGATION_RULES'])
-        settings["aggregation-rules"] = self["rules"]
+            self["aggregation-rules"] = join(settings["CONF_DIR"], settings['AGGREGATION_RULES'])
+        settings["aggregation-rules"] = self["aggregation-rules"]
 
-        if settings["RELAY_METHOD"] not in ("rules", "consistent-hashing", "aggregated-consistent-hashing"):
-            print ("In carbon.conf, RELAY_METHOD must be either 'rules' or "
-                   "'consistent-hashing' or 'aggregated-consistent-hashing'. Invalid value: '%s'" %
-                   settings.RELAY_METHOD)
-            sys.exit(1)
+        router = settings["RELAY_METHOD"]
+        if router not in DatapointRouter.plugins:
+            print ("In carbon.conf, RELAY_METHOD must be one of %s. "
+                   "Invalid value: '%s'" % (', '.join(DatapointRouter.plugins), router))
+            raise SystemExit(1)
 
 
 def get_default_parser(usage="%prog [options] <start|stop|status>"):
@@ -429,11 +454,17 @@ def get_default_parser(usage="%prog [options] <start|stop|status>"):
         "--debug", action="store_true",
         help="Run in the foreground, log to stdout")
     parser.add_option(
+        "--syslog", action="store_true",
+        help="Write logs to syslog")
+    parser.add_option(
         "--nodaemon", action="store_true",
         help="Run in the foreground")
     parser.add_option(
         "--profile",
         help="Record performance profile data to the given file")
+    parser.add_option(
+        "--profiler",
+        help="Specify the profiler to use")
     parser.add_option(
         "--pidfile", default=None,
         help="Write pid to the given file")
@@ -539,15 +570,18 @@ def read_config(program, options, **kwargs):
                         os.environ.get("GRAPHITE_STORAGE_DIR",
                                        join(graphite_root, "storage")))
 
-    # By default, everything is written to subdirectories of the storage dir.
-    settings.setdefault(
-        "PID_DIR", settings["STORAGE_DIR"])
-    settings.setdefault(
-        "LOG_DIR", join(settings["STORAGE_DIR"], "log", program))
-    settings.setdefault(
-        "LOCAL_DATA_DIR", join(settings["STORAGE_DIR"], "whisper"))
-    settings.setdefault(
-        "WHITELISTS_DIR", join(settings["STORAGE_DIR"], "lists"))
+    def update_STORAGE_DIR_deps():
+        # By default, everything is written to subdirectories of the storage dir.
+        settings.setdefault(
+            "PID_DIR", settings["STORAGE_DIR"])
+        settings.setdefault(
+            "LOG_DIR", join(settings["STORAGE_DIR"], "log", program))
+        settings.setdefault(
+            "LOCAL_DATA_DIR", join(settings["STORAGE_DIR"], "whisper"))
+        settings.setdefault(
+            "WHITELISTS_DIR", join(settings["STORAGE_DIR"], "lists"))
+
+
 
     # Read configuration options from program-specific section.
     section = program[len("carbon-"):]
@@ -558,6 +592,7 @@ def read_config(program, options, **kwargs):
 
     settings.readFrom(config, section)
     settings.setdefault("instance", options["instance"])
+    update_STORAGE_DIR_deps()
 
     # If a specific instance of the program is specified, augment the settings
     # with the instance-specific settings and provide sane defaults for
@@ -571,11 +606,12 @@ def read_config(program, options, **kwargs):
                  (program, options["instance"])))
         settings["LOG_DIR"] = (options["logdir"] or
                               join(settings["LOG_DIR"],
-                                "%s-%s" % (program ,options["instance"])))
+                                "%s-%s" % (program, options["instance"])))
     else:
         settings["pidfile"] = (
             options["pidfile"] or
             join(settings["PID_DIR"], '%s.pid' % program))
         settings["LOG_DIR"] = (options["logdir"] or settings["LOG_DIR"])
 
+    update_STORAGE_DIR_deps()
     return settings
